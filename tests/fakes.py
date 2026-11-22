@@ -9,7 +9,9 @@ from yandex_lavka_mcp.config import Config, Location
 
 HOMEPAGE_HTML = (
     '<html><script id="__page_props__-data" type="application/json">'
-    '{"csrfToken":"tok-123","x":1}</script></html>'
+    '{"csrfToken":"bff-456","authProxyCsrfToken":"tok-123","config":{}}</script>'
+    '<script id="storedehydratedstate-data" type="application/json">'
+    '{"startup":{"current":{"featureFlags":{"trustedUser":true}}}}</script></html>'
 )
 
 

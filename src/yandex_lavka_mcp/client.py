@@ -53,9 +53,25 @@ _CART_CONFLICT_RETRIES = 3  # re-read + retry on cartVersion 409 (shared-cart co
 # 409 re-read/retry in _cart_mutate.
 _CART_WRITE_LOCK = asyncio.Lock()
 
-# The anti-CSRF token Lavka's API requires is embedded in the homepage HTML:
-#   <script id="__page_props__-data" ...>{"csrfToken":"...", ...}</script>
-_CSRF_RE = re.compile(r'"csrfToken"\s*:\s*"([^"]+)"')
+# How Lavka's own frontend authenticates its API calls (reverse-engineered
+# 2026-11-22 from lavka.yandex.ru's JS bundle `main.*.desktop.js` and homepage
+# HTML — the previous single-token logic got 401 "[Csrf] Successful blocking"
+# on every POST):
+# - ``X-CSRF-Token`` = the ``authProxyCsrfToken`` from ``__page_props__``,
+#   which always equals the ``lavka__auth-proxy-ct`` cookie. Refreshable via
+#   ``GET /api/v2/csrf_token`` (answers ``{"sk": ...}``) when the server says
+#   the token itself is invalid.
+# - ``X-CSRF-Token-Bff`` = the ``csrfToken`` from ``__page_props__``
+#   (server-rendered per page load; the SPA keeps the first one in memory —
+#   "BFF" here is Backend-For-Frontend, not a token type). Missing header =
+#   "[Csrf] Successful blocking".
+# - ``X-Grocery-Trusted-User`` = ``String(startup.current.featureFlags
+#   .trustedUser)`` (also server-rendered into the homepage); Chrome sends
+#   ``true`` for a normal session.
+_CSRF_BFF_RE = re.compile(r'"csrfToken"\s*:\s*"([^"]+)"')
+_CSRF_AUTH_PROXY_RE = re.compile(r'"authProxyCsrfToken"\s*:\s*"([^"]+)"')
+_TRUSTED_USER_RE = re.compile(r'"trustedUser"\s*:\s*(true|false)')
+_CSRF_TOKEN_ENDPOINT = "/api/v2/csrf_token"
 
 
 def _pick(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -129,7 +145,12 @@ class LavkaClient:
         self._config = config
         self._base_url = resolve_base_url(config.base_url)
         self._client: httpx.AsyncClient | None = None
+        # X-CSRF-Token (== lavka__auth-proxy-ct cookie / authProxyCsrfToken).
         self._csrf_token: str | None = None
+        # X-CSRF-Token-Bff (== __page_props__ csrfToken).
+        self._csrf_bff: str | None = None
+        # X-Grocery-Trusted-User ("true"/"false" from startup flags).
+        self._trusted_user: str | None = None
 
     async def __aenter__(self) -> "LavkaClient":
         headers = {**_DEFAULT_HEADERS, **self._config.headers}
@@ -182,11 +203,36 @@ class LavkaClient:
         }
         if self._csrf_token:
             headers["X-CSRF-Token"] = self._csrf_token
+        if self._csrf_bff:
+            headers["X-CSRF-Token-Bff"] = self._csrf_bff
+        if self._trusted_user:
+            headers["X-Grocery-Trusted-User"] = self._trusted_user
         return headers
 
+    def _parse_homepage_auth(self, html_text: str) -> None:
+        """Pull the CSRF pair + trusted-user flag out of homepage HTML.
+
+        Mirrors the frontend: ``X-CSRF-Token`` is ``authProxyCsrfToken``
+        (falls back to the ``lavka__auth-proxy-ct`` cookie, which always
+        carries the same value), ``X-CSRF-Token-Bff`` is ``csrfToken``.
+        """
+        match = _CSRF_AUTH_PROXY_RE.search(html_text)
+        if match:
+            self._csrf_token = match.group(1)
+        if not self._csrf_token:
+            cookie_ct = self._config.cookies.get("lavka__auth-proxy-ct")
+            if cookie_ct:
+                self._csrf_token = cookie_ct
+        match = _CSRF_BFF_RE.search(html_text)
+        if match:
+            self._csrf_bff = match.group(1)
+        match = _TRUSTED_USER_RE.search(html_text)
+        if match:
+            self._trusted_user = match.group(1)
+
     async def _ensure_csrf(self, *, force: bool = False) -> None:
-        """Fetch the anti-CSRF token from the Lavka homepage HTML if we lack one."""
-        if self._csrf_token and not force:
+        """Fetch the anti-CSRF pair from the Lavka homepage if we lack one."""
+        if self._csrf_token and self._csrf_bff and not force:
             return
         assert self._client is not None
         resp = await self._client.get("/")
@@ -195,9 +241,31 @@ class LavkaClient:
                 f"Lavka session is not authorized (HTTP {resp.status_code}). "
                 "Re-capture your Yandex cookies."
             )
-        match = _CSRF_RE.search(resp.text)
-        if match:
-            self._csrf_token = match.group(1)
+        self._parse_homepage_auth(resp.text)
+
+    async def _refresh_auth_proxy_token(self) -> None:
+        """Refresh ``X-CSRF-Token`` via the csrf_token endpoint (browser parity).
+
+        The frontend's ``gP`` does ``GET /api/v2/csrf_token`` and takes ``sk``.
+        Used when the server reports the token itself invalid.
+        """
+        assert self._client is not None
+        resp = await self._client.get(
+            _CSRF_TOKEN_ENDPOINT, headers=self._lavka_headers()
+        )
+        if resp.status_code in (401, 403):
+            raise LavkaAuthError(
+                f"Lavka session is not authorized (HTTP {resp.status_code}). "
+                "Re-capture your Yandex cookies."
+            )
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise LavkaApiError("Non-JSON response from csrf_token.") from exc
+        sk = data.get("sk") if isinstance(data, dict) else None
+        if not sk or not isinstance(sk, str):
+            raise LavkaApiError("Invalid CSRF token response.")
+        self._csrf_token = sk
 
     async def _call(
         self,
@@ -229,7 +297,7 @@ class LavkaClient:
         # response on a retried request could submit the order twice.
         max_retries = _MAX_RETRIES if retry else 0
         await self._ensure_csrf()
-        csrf_refreshed = False
+        csrf_refresh_step = 0
         attempt = 0
         while True:
             try:
@@ -244,14 +312,27 @@ class LavkaClient:
                 raise LavkaApiError(f"Network error calling {name}: {exc}") from exc
 
             if resp.status_code in (401, 403):
-                # A stale CSRF token also shows up as 401 — refresh once and retry
+                # A stale CSRF pair also shows up as 401/403 — refresh and retry
                 # before concluding the session itself is dead. Doesn't use up a
                 # retry, and is safe even for non-retry calls: the request was
-                # rejected, so it never took effect.
-                if not csrf_refreshed:
-                    csrf_refreshed = True
+                # rejected, so it never took effect. First re-fetch the homepage
+                # (fresh BFF pair, fixes "[Csrf] Successful blocking"), then the
+                # csrf_token endpoint (fresh X-CSRF-Token, fixes "Invalid
+                # token"), mirroring the frontend's gS/gP retry.
+                if csrf_refresh_step == 0:
+                    csrf_refresh_step = 1
                     await self._ensure_csrf(force=True)
                     continue
+                if csrf_refresh_step == 1:
+                    csrf_refresh_step = 2
+                    try:
+                        await self._refresh_auth_proxy_token()
+                    except Exception:  # noqa: BLE001 - refresh failed; the
+                        # original request already failed twice with 401/403,
+                        # so conclude the session is dead below.
+                        pass
+                    else:
+                        continue
                 raise LavkaAuthError(
                     f"Lavka session is not authorized (HTTP {resp.status_code}). "
                     "Re-capture your Yandex cookies."

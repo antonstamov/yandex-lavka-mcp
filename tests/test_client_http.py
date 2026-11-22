@@ -55,8 +55,11 @@ async def test_search_trims_and_sends_real_body():
     assert body["position"]["location"] == [37.0, 55.0]  # [lon, lat]
     assert body["productsLimit"] == 5
     assert body["depotType"] == "regular"
-    # CSRF token pulled from the homepage and sent as a header
+    # CSRF pair pulled from the homepage and sent as headers (browser parity:
+    # X-CSRF-Token is authProxyCsrfToken, X-CSRF-Token-Bff is csrfToken)
     assert route.calls.last.request.headers["x-csrf-token"] == "tok-123"
+    assert route.calls.last.request.headers["x-csrf-token-bff"] == "bff-456"
+    assert route.calls.last.request.headers["x-grocery-trusted-user"] == "true"
     assert route.calls.last.request.headers["x-lavka-web-city"] == "213"
 
 
