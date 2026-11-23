@@ -95,6 +95,13 @@ uv pip install -e '.[browser]'
 python scripts/extract_chrome_cookies.py          # auto-detects your profile
 ```
 
+**Windows — pull cookies straight from Chrome** (close Chrome first — while
+it runs, its cookie database is locked):
+
+```bash
+python scripts/extract_chrome_cookies_win.py      # auto-detects your profile
+```
+
 **Any OS — paste the Cookie header** from DevTools (Network → any
 `lavka.yandex.ru` request → Request Headers → Cookie):
 
@@ -103,7 +110,10 @@ python scripts/import_cookies.py --header "Session_id=...; yandexuid=...; L=..."
 ```
 
 Session cookies expire — re-run when calls start failing with "Lavka session is
-not authorized".
+not authorized". Between refreshes the client saves the rotations the server
+sends back on successful calls into the config file by itself, so a manual
+re-import is only needed when the whole session is dead. No server restart is
+needed after a refresh: the config file is re-read on every tool call.
 
 ### 3. Set a delivery location
 

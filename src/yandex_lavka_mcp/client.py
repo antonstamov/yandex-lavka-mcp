@@ -26,7 +26,7 @@ from urllib.parse import quote, unquote
 
 import httpx
 
-from .config import Config
+from .config import Config, load_config, save_config
 from .endpoints import resolve_base_url, resolve_endpoint
 from .errors import LavkaApiError, LavkaAuthError, LavkaConfigError
 
@@ -72,6 +72,22 @@ _CSRF_BFF_RE = re.compile(r'"csrfToken"\s*:\s*"([^"]+)"')
 _CSRF_AUTH_PROXY_RE = re.compile(r'"authProxyCsrfToken"\s*:\s*"([^"]+)"')
 _TRUSTED_USER_RE = re.compile(r'"trustedUser"\s*:\s*(true|false)')
 _CSRF_TOKEN_ENDPOINT = "/api/v2/csrf_token"
+
+# Appended to every "session is dead" error so the fix is one command, not a
+# debugging session. No server restart is needed afterwards: the config file
+# is re-read on every tool call.
+_AUTH_HINT = (
+    "Re-capture your Yandex cookies: close Chrome and run "
+    "python scripts/extract_chrome_cookies_win.py (Windows) or "
+    "scripts/extract_chrome_cookies.py (macOS), or re-import a Cookie header "
+    "with scripts/import_cookies.py --header \"...\"."
+)
+
+
+def _auth_error(status: int) -> LavkaAuthError:
+    return LavkaAuthError(
+        f"Lavka session is not authorized (HTTP {status}). {_AUTH_HINT}"
+    )
 
 
 def _pick(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -237,10 +253,7 @@ class LavkaClient:
         assert self._client is not None
         resp = await self._client.get("/")
         if resp.status_code in (401, 403):
-            raise LavkaAuthError(
-                f"Lavka session is not authorized (HTTP {resp.status_code}). "
-                "Re-capture your Yandex cookies."
-            )
+            raise _auth_error(resp.status_code)
         self._parse_homepage_auth(resp.text)
 
     async def _refresh_auth_proxy_token(self) -> None:
@@ -254,10 +267,7 @@ class LavkaClient:
             _CSRF_TOKEN_ENDPOINT, headers=self._lavka_headers()
         )
         if resp.status_code in (401, 403):
-            raise LavkaAuthError(
-                f"Lavka session is not authorized (HTTP {resp.status_code}). "
-                "Re-capture your Yandex cookies."
-            )
+            raise _auth_error(resp.status_code)
         try:
             data = resp.json()
         except ValueError as exc:
@@ -266,6 +276,32 @@ class LavkaClient:
         if not sk or not isinstance(sk, str):
             raise LavkaApiError("Invalid CSRF token response.")
         self._csrf_token = sk
+
+    def _persist_cookies(self) -> None:
+        """Write server-rotated cookies back to the file config, if any changed.
+
+        Yandex rotates some cookies on its own schedule; the responses to our
+        own calls carry the fresh values, so the on-disk session stays in sync
+        without a manual re-import. Guardrails: only for file-backed configs
+        (never tests/one-off scripts), only non-empty values, only on change,
+        and never allowed to fail the call that just succeeded.
+        """
+        try:
+            if not self._config.from_file or self._client is None:
+                return
+            fresh = load_config()
+            if not fresh.from_file:
+                return
+            changed = False
+            for c in self._client.cookies.jar:
+                if not c.value or fresh.cookies.get(c.name) == c.value:
+                    continue
+                fresh.cookies[c.name] = c.value
+                changed = True
+            if changed:
+                save_config(fresh)
+        except Exception:  # noqa: BLE001 - persistence is best-effort
+            pass
 
     async def _call(
         self,
@@ -333,10 +369,7 @@ class LavkaClient:
                         pass
                     else:
                         continue
-                raise LavkaAuthError(
-                    f"Lavka session is not authorized (HTTP {resp.status_code}). "
-                    "Re-capture your Yandex cookies."
-                )
+                raise _auth_error(resp.status_code)
             if resp.status_code >= 500 and attempt < max_retries:
                 attempt += 1
                 await asyncio.sleep(_RETRY_BACKOFF_SECONDS * attempt)
@@ -361,6 +394,7 @@ class LavkaClient:
                     "with scripts/solve_captcha.py and set the `spravka` it prints as "
                     "YANDEX_LAVKA_MCP_SPRAVKA."
                 )
+            self._persist_cookies()
             return data
 
     # -- trimming ----------------------------------------------------------

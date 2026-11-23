@@ -88,6 +88,10 @@ class Config:
     # default: the code falls back to the seeded defaults.
     base_url: str | None = None
     endpoints: dict[str, Any] = field(default_factory=dict)
+    # True when this config was loaded from the config file (not inline env).
+    # Only then may the client write server-rotated cookies back to disk —
+    # in-memory configs (tests, one-off scripts) must never touch the file.
+    from_file: bool = field(default=False, repr=False, compare=False)
 
     def is_authenticated(self) -> bool:
         # Session_id is the cookie Yandex uses to identify a logged-in user.
@@ -122,6 +126,7 @@ def load_config() -> Config:
     # secret) instead of a file on disk.
     inline = os.environ.get("YANDEX_LAVKA_MCP_CONFIG_JSON")
     path = config_path()
+    from_file = not bool(inline)
     if inline:
         config = _config_from_dict(json.loads(inline))
     elif path.exists():
@@ -129,6 +134,7 @@ def load_config() -> Config:
             config = _config_from_dict(json.load(fh))
     else:
         config = Config()
+    config.from_file = from_file
     # A server's captcha pass (see scripts/solve_captcha.py) is renewed on its own
     # schedule, apart from the session cookies, so a cookie refresh can't drop it.
     spravka = os.environ.get("YANDEX_LAVKA_MCP_SPRAVKA", "").strip()
